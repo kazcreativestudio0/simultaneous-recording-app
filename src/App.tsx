@@ -75,6 +75,25 @@ const getSegmentSummaryLabel = (text: string) => {
   return firstChunk.length > 14 ? `${firstChunk.slice(0, 14)}…` : firstChunk;
 };
 
+const getSegmentDisplayLabel = (
+  seg: TranscriptSegment,
+  conversationNodes: ConversationNode[]
+) => {
+  const linkedNodes = conversationNodes.filter(
+    (node) => node.sourceSegmentIds?.includes(seg.id) && node.shortLabel
+  );
+  if (linkedNodes.length > 0) {
+    // Prefer more concrete labels over broad summary labels.
+    const sorted = [...linkedNodes].sort((a, b) => {
+      if (a.type === 'summary' && b.type !== 'summary') return 1;
+      if (a.type !== 'summary' && b.type === 'summary') return -1;
+      return (a.shortLabel?.length || 99) - (b.shortLabel?.length || 99);
+    });
+    return sorted[0].shortLabel;
+  }
+  return getSegmentSummaryLabel(seg.text);
+};
+
 const escapeHtml = (value: string) =>
   value
     .replaceAll('&', '&amp;')
@@ -409,7 +428,7 @@ const MainStream = ({
       >
         {transcript.map((seg) => {
           const isSelected = conversationNodes.some(n => n.id === selectedNodeId && n.sourceSegmentIds?.includes(seg.id));
-          const summaryLabel = getSegmentSummaryLabel(seg.text);
+          const summaryLabel = getSegmentDisplayLabel(seg, conversationNodes);
           return (
             <motion.div 
               key={seg.id}
