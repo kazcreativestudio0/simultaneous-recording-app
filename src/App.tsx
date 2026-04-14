@@ -1,0 +1,678 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import React, { useState, useEffect, useRef } from 'react';
+import { motion, AnimatePresence } from 'motion/react';
+import { 
+  Mic, 
+  Square, 
+  Network, 
+  MessageSquare, 
+  Lightbulb, 
+  CheckCircle2, 
+  BookOpen, 
+  ChevronRight,
+  RefreshCw,
+  Activity,
+  User,
+  Clock,
+  LayoutDashboard
+} from 'lucide-react';
+import { useTranscription, TranscriptSegment } from './hooks/useTranscription';
+import { analyzeConversation, getTermDefinition, ConversationNode, InsightData } from './services/aiService';
+
+import { 
+  Group, 
+  Panel, 
+  Separator 
+} from 'react-resizable-panels';
+
+// --- Components ---
+
+const Header = () => (
+  <header className="h-14 border-b border-gray-200 bg-white flex items-center justify-between px-6 sticky top-0 z-50">
+    <div className="flex items-center gap-2">
+      <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center text-white">
+        <Network size={20} />
+      </div>
+      <h1 className="font-bold text-xl tracking-tight text-gray-900">EchoMap</h1>
+      <span className="text-xs font-medium px-2 py-0.5 bg-blue-50 text-blue-600 rounded-full border border-blue-100 ml-2">BETA</span>
+    </div>
+    <div className="flex items-center gap-4">
+      <div className="flex items-center gap-2 text-sm text-gray-500">
+        <Activity size={14} className="text-green-500 animate-pulse" />
+        <span>System Ready</span>
+      </div>
+      <div className="w-8 h-8 rounded-full bg-gray-100 border border-gray-200 flex items-center justify-center text-gray-600">
+        <User size={18} />
+      </div>
+    </div>
+  </header>
+);
+
+import ReactFlow, { 
+  Background, 
+  Controls, 
+  MiniMap, 
+  Node, 
+  Edge, 
+  Handle, 
+  Position,
+  useNodesState,
+  useEdgesState,
+  MarkerType
+} from 'reactflow';
+import 'reactflow/dist/style.css';
+
+// --- Custom Node Component ---
+
+const LogicNode = ({ data }: { data: any }) => {
+  const [isExpanded, setIsExpanded] = useState(false);
+  
+  const typeLabels: Record<string, string> = {
+    topic: '話題',
+    reason: '理由',
+    example: '具体例',
+    supplement: '補足',
+    summary: '統合要約'
+  };
+
+  const colorClass = 
+    data.type === 'topic' ? 'border-blue-500 bg-blue-50 text-blue-900' : 
+    data.type === 'reason' ? 'border-orange-400 bg-orange-50 text-orange-900' : 
+    data.type === 'example' ? 'border-green-400 bg-green-50 text-green-900' : 
+    data.type === 'summary' ? 'border-red-500 bg-red-50 text-red-900' :
+    'border-slate-400 bg-slate-50 text-slate-900';
+
+  const isSelected = data.selectedNodeId === data.id;
+
+  return (
+    <div 
+      className={`px-4 py-2 shadow-lg rounded-xl border-2 transition-all duration-300 cursor-pointer relative ${colorClass} ${isExpanded ? 'w-[320px]' : 'w-[180px]'} ${data.isNew ? 'ring-4 ring-yellow-400 ring-offset-2' : ''} ${isSelected ? 'ring-4 ring-blue-400 scale-105 z-30' : ''}`}
+      onClick={(e) => {
+        e.stopPropagation();
+        setIsExpanded(!isExpanded);
+        data.onNodeSelect(data.id);
+      }}
+    >
+      {data.isNew && (
+        <div className="absolute -top-3 -right-3 bg-yellow-400 text-white text-[10px] font-bold px-2 py-0.5 rounded-full shadow-sm z-20">
+          NEW
+        </div>
+      )}
+      <Handle type="target" position={Position.Left} className="!w-2 !h-2 !bg-gray-300" />
+      <div className="flex items-center justify-between mb-1">
+        <div className="text-[9px] font-bold uppercase tracking-wider opacity-60">
+          {typeLabels[data.type] || data.type}
+        </div>
+        <div className="text-[9px] bg-white/50 px-1 rounded border border-black/5">
+          {isExpanded ? '閉じる' : '詳細'}
+        </div>
+      </div>
+      <div className={`text-sm font-medium leading-tight ${isExpanded ? '' : 'truncate'}`}>
+        {isExpanded ? data.text : (data.shortLabel || data.text)}
+      </div>
+      <Handle type="source" position={Position.Right} className="!w-2 !h-2 !bg-gray-300" />
+    </div>
+  );
+};
+
+const nodeTypes = {
+  logic: LogicNode,
+};
+
+const LogicalMap = ({ 
+  conversationNodes, 
+  selectedNodeId, 
+  onNodeSelect, 
+  isAnalyzing,
+  onRefresh
+}: { 
+  conversationNodes: ConversationNode[], 
+  selectedNodeId: string | null, 
+  onNodeSelect: (id: string) => void, 
+  isAnalyzing: boolean,
+  onRefresh: () => void
+}) => {
+  const [nodes, setNodes, onNodesChange] = useNodesState([]);
+  const [edges, setEdges, onEdgesChange] = useEdgesState([]);
+  const prevNodesCount = useRef(0);
+
+  useEffect(() => {
+    const newNodes: Node[] = [];
+    const newEdges: Edge[] = [];
+
+    const rootTopics = conversationNodes.filter(n => !n.parentId);
+    
+    // Horizontal subtree height calculation
+    const getSubtreeHeight = (nodeId: string): number => {
+      const children = conversationNodes.filter(n => n.parentId === nodeId);
+      if (children.length === 0) return 100; // Base height for a single node
+      return children.reduce((sum, child) => sum + getSubtreeHeight(child.id), 0);
+    };
+
+    const layoutNode = (nodeId: string, depth: number, yStart: number, totalHeight: number) => {
+      const node = conversationNodes.find(n => n.id === nodeId);
+      if (!node) return;
+
+      const x = depth * 280;
+      const y = yStart + totalHeight / 2 - 40;
+
+      // Check if this node is "new" (added in the last update)
+      const isNew = conversationNodes.indexOf(node) >= prevNodesCount.current;
+
+      newNodes.push({
+        id: node.id,
+        type: 'logic',
+        data: { 
+          id: node.id,
+          text: node.text, 
+          shortLabel: node.shortLabel, 
+          type: node.type, 
+          isNew,
+          selectedNodeId,
+          onNodeSelect
+        },
+        position: { x, y },
+        draggable: true,
+      });
+
+      const children = conversationNodes.filter(n => n.parentId === nodeId);
+      let currentY = yStart;
+      children.forEach((child) => {
+        const childHeight = getSubtreeHeight(child.id);
+        
+        newEdges.push({
+          id: `e-${nodeId}-${child.id}`,
+          source: nodeId,
+          target: child.id,
+          animated: true,
+          style: { stroke: '#94A3B8', strokeWidth: 2 },
+          markerEnd: { type: MarkerType.ArrowClosed, color: '#94A3B8' },
+        });
+
+        layoutNode(child.id, depth + 1, currentY, childHeight);
+        currentY += childHeight;
+      });
+    };
+
+    let currentRootY = 0;
+    rootTopics.forEach((root) => {
+      const rootHeight = getSubtreeHeight(root.id);
+      layoutNode(root.id, 0, currentRootY, rootHeight);
+      currentRootY += rootHeight + 100;
+    });
+
+    setNodes(newNodes);
+    setEdges(newEdges);
+    prevNodesCount.current = conversationNodes.length;
+  }, [conversationNodes, selectedNodeId, onNodeSelect]);
+
+  return (
+    <div className="h-full w-full bg-gray-50 relative" onClick={() => onNodeSelect('')}>
+      <div className="absolute top-4 left-4 z-10 flex items-center gap-3 bg-white/80 backdrop-blur p-2 px-3 rounded-lg border border-gray-200 shadow-sm">
+        <Network size={18} className="text-blue-600" />
+        <h2 className="font-semibold text-gray-700 text-sm">論理構造マップ</h2>
+        {isAnalyzing && (
+          <div className="flex items-center gap-2 ml-2 pl-3 border-l border-gray-200">
+            <div className="w-2 h-2 bg-blue-500 rounded-full animate-ping" />
+            <span className="text-[10px] font-bold text-blue-600 animate-pulse">更新中...</span>
+          </div>
+        )}
+        <button 
+          onClick={(e) => { e.stopPropagation(); onRefresh(); }}
+          disabled={isAnalyzing}
+          className="ml-2 p-1.5 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-all disabled:opacity-30"
+          title="強制的にマップを更新"
+        >
+          <RefreshCw size={14} className={isAnalyzing ? 'animate-spin' : ''} />
+        </button>
+      </div>
+      <ReactFlow
+        nodes={nodes}
+        edges={edges}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
+        nodeTypes={nodeTypes}
+        fitView
+        className="bg-dots-gray-200"
+      >
+        <Background color="#E5E7EB" gap={20} />
+        <Controls />
+        <MiniMap nodeStrokeWidth={3} zoomable pannable />
+      </ReactFlow>
+      {nodes.length === 0 && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center text-center p-8 opacity-40 pointer-events-none">
+          <div className="w-12 h-12 bg-gray-100 rounded-full flex items-center justify-center mb-3">
+            <Network size={24} />
+          </div>
+          <p className="text-sm">録音を開始すると、マインドマップが生成されます</p>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const MainStream = ({ 
+  transcript, 
+  interimText, 
+  summary, 
+  isRecording, 
+  onToggleRecording,
+  selectedNodeId,
+  conversationNodes,
+  keyTerms
+}: { 
+  transcript: TranscriptSegment[], 
+  interimText: string,
+  summary: string,
+  isRecording: boolean,
+  onToggleRecording: () => void,
+  selectedNodeId: string | null,
+  conversationNodes: ConversationNode[],
+  keyTerms: { term: string }[]
+}) => {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
+
+  const handleScroll = () => {
+    if (!scrollRef.current) return;
+    const { scrollTop, scrollHeight, clientHeight } = scrollRef.current;
+    // If user is within 50px of bottom, enable auto-scroll
+    const isAtBottom = scrollHeight - scrollTop - clientHeight < 50;
+    setShouldAutoScroll(isAtBottom);
+  };
+
+  useEffect(() => {
+    if (scrollRef.current && shouldAutoScroll) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [transcript, interimText, shouldAutoScroll]);
+
+  // Find which nodes a segment belongs to and highlight snippets + key terms
+  const renderHighlightedText = (seg: TranscriptSegment) => {
+    const nodes = conversationNodes.filter(n => n.sourceSegmentIds?.includes(seg.id));
+    
+    let text = seg.text;
+    const colors: Record<string, string> = {
+      topic: 'decoration-blue-400',
+      reason: 'decoration-orange-400',
+      example: 'decoration-green-400',
+      summary: 'decoration-red-400',
+      supplement: 'decoration-slate-400'
+    };
+
+    let parts: (string | React.ReactNode)[] = [text];
+
+    // 1. Highlight Logic Nodes (Snippets)
+    const snippets = nodes
+      .filter(n => n.sourceTextSnippet)
+      .sort((a, b) => (b.sourceTextSnippet?.length || 0) - (a.sourceTextSnippet?.length || 0));
+
+    snippets.forEach(node => {
+      const snippet = node.sourceTextSnippet!;
+      const isSelected = selectedNodeId === node.id;
+      
+      parts = parts.flatMap(part => {
+        if (typeof part !== 'string') return part;
+        const index = part.indexOf(snippet);
+        if (index === -1) return part;
+
+        return [
+          part.substring(0, index),
+          <span 
+            key={`node-${node.id}-${index}`}
+            className={`underline decoration-2 underline-offset-4 transition-all duration-300 ${colors[node.type]} ${isSelected ? 'bg-yellow-100 font-bold' : ''}`}
+          >
+            {snippet}
+          </span>,
+          part.substring(index + snippet.length)
+        ];
+      });
+    });
+
+    // 2. Highlight Key Terms (Pink)
+    keyTerms.forEach((termObj, termIdx) => {
+      const term = termObj.term;
+      parts = parts.flatMap(part => {
+        if (typeof part !== 'string') return part;
+        const index = part.indexOf(term);
+        if (index === -1) return part;
+
+        return [
+          part.substring(0, index),
+          <span 
+            key={`term-${termIdx}-${index}`}
+            className="underline decoration-2 underline-offset-4 decoration-pink-400 bg-pink-50/50 font-medium"
+          >
+            {term}
+          </span>,
+          part.substring(index + term.length)
+        ];
+      });
+    });
+
+    return <p className="text-gray-700 leading-relaxed">{parts}</p>;
+  };
+
+  return (
+    <div className="h-full flex flex-col bg-white border-x border-gray-200">
+      {/* Summary Area */}
+      <div className="p-4 border-b border-gray-100 bg-blue-50/30">
+        <div className="flex items-center gap-2 mb-2">
+          <Lightbulb size={16} className="text-blue-600" />
+          <span className="text-xs font-bold text-blue-800 uppercase tracking-widest">Live Summary</span>
+        </div>
+        <div className="min-h-[60px] flex items-center">
+          {summary ? (
+            <motion.p 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              className="text-sm text-gray-700 leading-relaxed font-medium"
+            >
+              {summary}
+            </motion.p>
+          ) : (
+            <p className="text-sm text-gray-400 italic">
+              {isRecording ? "会話を分析中..." : "録音を開始すると要約が表示されます"}
+            </p>
+          )}
+        </div>
+      </div>
+
+      {/* Transcript Area */}
+      <div 
+        ref={scrollRef}
+        onScroll={handleScroll}
+        className="flex-1 overflow-y-auto p-6 space-y-6 custom-scrollbar"
+      >
+        {transcript.map((seg) => {
+          const isSelected = conversationNodes.some(n => n.id === selectedNodeId && n.sourceSegmentIds?.includes(seg.id));
+          return (
+            <motion.div 
+              key={seg.id}
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              className={`flex gap-4 p-2 rounded-xl transition-all duration-300 ${isSelected ? 'ring-2 ring-blue-400 bg-blue-50/30 shadow-md scale-[1.02]' : ''}`}
+            >
+              <div className="flex-shrink-0 w-10 h-10 rounded-full bg-gray-100 flex items-center justify-center text-gray-500 font-bold border border-gray-200">
+                {seg.speaker[0]}
+              </div>
+              <div className="flex-1">
+                <div className="flex items-center gap-2 mb-1">
+                  <span className="font-bold text-sm text-gray-900">{seg.speaker}</span>
+                  <span className="text-[10px] text-gray-400">{new Date(seg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                </div>
+                {renderHighlightedText(seg)}
+              </div>
+            </motion.div>
+          );
+        })}
+        {interimText && (
+          <div className="flex gap-4 opacity-50">
+            <div className="flex-shrink-0 w-10 h-10 rounded-full bg-gray-50 flex items-center justify-center text-gray-300 border border-gray-100">
+              ?
+            </div>
+            <div className="flex-1">
+              <p className="text-gray-500 italic">{interimText}...</p>
+            </div>
+          </div>
+        )}
+        {transcript.length === 0 && !interimText && (
+          <div className="h-full flex flex-col items-center justify-center text-center opacity-30">
+            <MessageSquare size={48} className="mb-4" />
+            <p className="text-lg font-medium">会話の記録はありません</p>
+            <p className="text-sm">下のボタンを押して録音を開始してください</p>
+          </div>
+        )}
+      </div>
+
+      {/* Control Bar */}
+      <div className="p-6 border-t border-gray-100 bg-gray-50/50">
+        <div className="flex items-center justify-between max-w-2xl mx-auto">
+          <div className="flex items-center gap-4">
+            <button
+              onClick={onToggleRecording}
+              className={`w-14 h-14 rounded-full flex items-center justify-center transition-all shadow-lg hover:scale-105 active:scale-95 ${
+                isRecording 
+                  ? 'bg-red-500 text-white hover:bg-red-600' 
+                  : 'bg-blue-600 text-white hover:bg-blue-700'
+              }`}
+            >
+              {isRecording ? <Square size={24} fill="currentColor" /> : <Mic size={24} />}
+            </button>
+            <div>
+              <p className="font-bold text-gray-900">{isRecording ? 'Recording...' : 'Ready to record'}</p>
+              <div className="flex items-center gap-2">
+                <div className="flex gap-0.5">
+                  {[1, 2, 3, 4, 5].map(i => (
+                    <motion.div 
+                      key={i}
+                      animate={isRecording ? { height: [4, 12, 4] } : { height: 4 }}
+                      transition={{ repeat: Infinity, duration: 0.5, delay: i * 0.1 }}
+                      className={`w-1 rounded-full ${isRecording ? 'bg-red-400' : 'bg-gray-300'}`}
+                    />
+                  ))}
+                </div>
+                <span className="text-xs text-gray-500 font-mono">00:00:00</span>
+              </div>
+            </div>
+          </div>
+          <div className="flex gap-2">
+            <button className="p-2 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg transition-colors">
+              <LayoutDashboard size={20} />
+            </button>
+            <button className="p-2 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg transition-colors">
+              <Clock size={20} />
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const InsightPanel = ({ keyTerms, onAddTerm }: { keyTerms: { term: string, definition: string, detail?: string }[], onAddTerm: (term: string) => void }) => {
+  const [expandedTerm, setExpandedTerm] = useState<string | null>(null);
+  const [manualTerm, setManualTerm] = useState('');
+  const [isAdding, setIsAdding] = useState(false);
+
+  const handleAdd = async () => {
+    if (!manualTerm.trim()) return;
+    setIsAdding(true);
+    await onAddTerm(manualTerm);
+    setManualTerm('');
+    setIsAdding(false);
+  };
+
+  return (
+    <div className="h-full flex flex-col p-6 overflow-y-auto custom-scrollbar space-y-8">
+      {/* Manual Add */}
+      <section>
+        <div className="flex items-center gap-2 mb-4">
+          <Lightbulb size={18} className="text-blue-600" />
+          <h2 className="font-bold text-gray-800 tracking-tight">用語を調べる</h2>
+        </div>
+        <div className="flex gap-2">
+          <input 
+            type="text" 
+            value={manualTerm}
+            onChange={(e) => setManualTerm(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
+            placeholder="わからない言葉を入力..."
+            className="flex-1 text-xs p-2.5 bg-white border border-gray-200 rounded-xl focus:ring-2 focus:ring-blue-400 focus:outline-none transition-all"
+          />
+          <button 
+            onClick={handleAdd}
+            disabled={isAdding}
+            className="p-2.5 bg-blue-600 text-white rounded-xl hover:bg-blue-700 disabled:opacity-50 transition-colors"
+          >
+            {isAdding ? <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : <ChevronRight size={18} />}
+          </button>
+        </div>
+      </section>
+
+      {/* Key Terms */}
+      <section>
+        <div className="flex items-center gap-2 mb-4">
+          <BookOpen size={18} className="text-pink-600" />
+          <h2 className="font-bold text-gray-800 tracking-tight">用語解説</h2>
+        </div>
+        <div className="space-y-4">
+          {keyTerms.length > 0 ? keyTerms.map((item, i) => (
+            <motion.div 
+              key={i}
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              className={`p-4 bg-pink-50/50 border border-pink-100 rounded-2xl cursor-pointer transition-all ${expandedTerm === item.term ? 'ring-2 ring-pink-400 shadow-md' : ''}`}
+              onClick={() => setExpandedTerm(expandedTerm === item.term ? null : item.term)}
+            >
+              <div className="flex items-center justify-between mb-1">
+                <h3 className="font-bold text-pink-900 text-sm">{item.term}</h3>
+                <ChevronRight size={14} className={`text-pink-400 transition-transform ${expandedTerm === item.term ? 'rotate-90' : ''}`} />
+              </div>
+              <p className="text-xs text-pink-800/70 leading-relaxed">{item.definition}</p>
+              <AnimatePresence>
+                {expandedTerm === item.term && item.detail && (
+                  <motion.div
+                    initial={{ height: 0, opacity: 0 }}
+                    animate={{ height: 'auto', opacity: 1 }}
+                    exit={{ height: 0, opacity: 0 }}
+                    className="mt-3 pt-3 border-t border-pink-100 overflow-hidden"
+                  >
+                    <p className="text-[11px] text-pink-900/60 leading-relaxed italic">
+                      {item.detail}
+                    </p>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </motion.div>
+          )) : (
+            <p className="text-sm text-gray-400 italic px-2">専門用語の解説がここに表示されます</p>
+          )}
+        </div>
+      </section>
+    </div>
+  );
+};
+
+// --- Main App ---
+
+export default function App() {
+  const { isRecording, transcript, interimText, startRecording, stopRecording } = useTranscription();
+  const [insights, setInsights] = useState<InsightData>({
+    summary: '',
+    nodes: [],
+    keyTerms: []
+  });
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const lastAnalyzedIndex = useRef(0);
+
+  const handleManualRefresh = async () => {
+    if (transcript.length === 0 || isAnalyzing) return;
+    setIsAnalyzing(true);
+    const fullText = transcript.map(t => `[ID:${t.id}] ${t.speaker}: ${t.text}`).join('\n');
+    const result = await analyzeConversation(fullText, insights.nodes);
+    if (result) {
+      setInsights(prev => ({
+        summary: result.summary,
+        nodes: result.nodes,
+        keyTerms: [...prev.keyTerms, ...result.keyTerms.filter(t => !prev.keyTerms.find(pt => pt.term === t.term))]
+      }));
+      lastAnalyzedIndex.current = transcript.length;
+    }
+    setIsAnalyzing(false);
+  };
+
+  // Analyze conversation every 3 segments
+  useEffect(() => {
+    const analyze = async () => {
+      if (transcript.length > 0 && transcript.length % 3 === 0 && transcript.length !== lastAnalyzedIndex.current) {
+        handleManualRefresh();
+      }
+    };
+    analyze();
+  }, [transcript]);
+
+  const handleManualAddTerm = async (term: string) => {
+    const result = await getTermDefinition(term);
+    if (result) {
+      setInsights(prev => ({
+        ...prev,
+        keyTerms: [result, ...prev.keyTerms.filter(t => t.term !== result.term)]
+      }));
+    }
+  };
+
+  return (
+    <div className="flex flex-col h-screen bg-[#F8F9FA] font-sans text-gray-900 selection:bg-blue-100">
+      <Header />
+      
+      <main className="flex-1 overflow-hidden">
+        <Group direction="horizontal">
+          {/* Left Column: Logical Map */}
+          <Panel defaultSize={40} minSize={20}>
+            <div className="h-full bg-gray-50/50 border-r border-gray-200">
+              <LogicalMap 
+                conversationNodes={insights.nodes} 
+                selectedNodeId={selectedNodeId}
+                onNodeSelect={setSelectedNodeId}
+                isAnalyzing={isAnalyzing}
+                onRefresh={handleManualRefresh}
+              />
+            </div>
+          </Panel>
+
+          <Separator className="w-1 hover:w-1.5 bg-gray-200 hover:bg-blue-400 transition-all duration-200 cursor-col-resize relative z-50" />
+
+          {/* Center Column: Main Stream */}
+          <Panel defaultSize={35} minSize={25}>
+            <div className="h-full">
+              <MainStream 
+                transcript={transcript} 
+                interimText={interimText}
+                summary={insights.summary}
+                isRecording={isRecording}
+                onToggleRecording={isRecording ? stopRecording : startRecording}
+                selectedNodeId={selectedNodeId}
+                conversationNodes={insights.nodes}
+                keyTerms={insights.keyTerms}
+              />
+            </div>
+          </Panel>
+
+          <Separator className="w-1 hover:w-1.5 bg-gray-200 hover:bg-blue-400 transition-all duration-200 cursor-col-resize relative z-50" />
+
+          {/* Right Column: Insights */}
+          <Panel defaultSize={25} minSize={15}>
+            <div className="h-full bg-gray-50/50">
+              <InsightPanel 
+                keyTerms={insights.keyTerms} 
+                onAddTerm={handleManualAddTerm}
+              />
+            </div>
+          </Panel>
+        </Group>
+      </main>
+
+      <style dangerouslySetInnerHTML={{ __html: `
+        .custom-scrollbar::-webkit-scrollbar {
+          width: 6px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+          background: transparent;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+          background: #E5E7EB;
+          border-radius: 10px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+          background: #D1D5DB;
+        }
+      `}} />
+    </div>
+  );
+}

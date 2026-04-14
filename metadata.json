@@ -1,0 +1,6 @@
+{
+  "name": "EchoMap - Real-time Conversation Intelligence",
+  "description": "録音しながら会話の論理構造をリアルタイムで図解・要約し、その場での理解を深めるSaaS型会話理解アプリ。",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": []
+}
