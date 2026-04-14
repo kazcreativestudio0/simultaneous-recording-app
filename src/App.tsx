@@ -18,10 +18,12 @@ import {
   Activity,
   User,
   Clock,
-  LayoutDashboard
+  LayoutDashboard,
+  FileDown
 } from 'lucide-react';
 import { useTranscription, TranscriptSegment } from './hooks/useTranscription';
 import { analyzeConversation, getTermDefinition, ConversationNode, InsightData } from './services/aiService';
+import html2pdf from 'html2pdf.js';
 
 import { 
   Group, 
@@ -65,6 +67,21 @@ import ReactFlow, {
   MarkerType
 } from 'reactflow';
 import 'reactflow/dist/style.css';
+
+const getSegmentSummaryLabel = (text: string) => {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (!normalized) return '要点';
+  const firstChunk = normalized.split(/[。！？!?、,]/)[0]?.trim() || normalized;
+  return firstChunk.length > 14 ? `${firstChunk.slice(0, 14)}…` : firstChunk;
+};
+
+const escapeHtml = (value: string) =>
+  value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
 
 // --- Custom Node Component ---
 
@@ -261,6 +278,7 @@ const MainStream = ({
   summary, 
   isRecording, 
   onToggleRecording,
+  onExportPdf,
   selectedNodeId,
   conversationNodes,
   keyTerms
@@ -270,6 +288,7 @@ const MainStream = ({
   summary: string,
   isRecording: boolean,
   onToggleRecording: () => void,
+  onExportPdf: () => void,
   selectedNodeId: string | null,
   conversationNodes: ConversationNode[],
   keyTerms: { term: string }[]
@@ -390,6 +409,7 @@ const MainStream = ({
       >
         {transcript.map((seg) => {
           const isSelected = conversationNodes.some(n => n.id === selectedNodeId && n.sourceSegmentIds?.includes(seg.id));
+          const summaryLabel = getSegmentSummaryLabel(seg.text);
           return (
             <motion.div 
               key={seg.id}
@@ -398,11 +418,12 @@ const MainStream = ({
               className={`flex gap-4 p-2 rounded-xl transition-all duration-300 ${isSelected ? 'ring-2 ring-blue-400 bg-blue-50/30 shadow-md scale-[1.02]' : ''}`}
             >
               <div className="flex-shrink-0 w-10 h-10 rounded-full bg-gray-100 flex items-center justify-center text-gray-500 font-bold border border-gray-200">
-                {seg.speaker[0]}
+                {summaryLabel[0]}
               </div>
               <div className="flex-1">
                 <div className="flex items-center gap-2 mb-1">
-                  <span className="font-bold text-sm text-gray-900">{seg.speaker}</span>
+                  <span className="font-bold text-sm text-gray-900">{summaryLabel}</span>
+                  <span className="text-[10px] text-blue-500 bg-blue-50 px-2 py-0.5 rounded-full border border-blue-100">要約ラベル</span>
                   <span className="text-[10px] text-gray-400">{new Date(seg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                 </div>
                 {renderHighlightedText(seg)}
@@ -461,6 +482,17 @@ const MainStream = ({
             </div>
           </div>
           <div className="flex gap-2">
+            <button
+              onClick={onExportPdf}
+              disabled={transcript.length === 0}
+              className="px-3 py-2 text-xs font-semibold text-gray-600 hover:text-blue-700 hover:bg-blue-50 rounded-lg transition-colors border border-gray-200 disabled:opacity-40 disabled:cursor-not-allowed"
+              title="録音全体をPDFとして保存"
+            >
+              <span className="inline-flex items-center gap-1.5">
+                <FileDown size={16} />
+                PDF保存
+              </span>
+            </button>
             <button className="p-2 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg transition-colors">
               <LayoutDashboard size={20} />
             </button>
@@ -574,7 +606,9 @@ export default function App() {
   const handleManualRefresh = async () => {
     if (transcript.length === 0 || isAnalyzing) return;
     setIsAnalyzing(true);
-    const fullText = transcript.map(t => `[ID:${t.id}] ${t.speaker}: ${t.text}`).join('\n');
+    const fullText = transcript
+      .map(t => `[ID:${t.id}] ${getSegmentSummaryLabel(t.text)}: ${t.text}`)
+      .join('\n');
     const result = await analyzeConversation(fullText, insights.nodes);
     if (result) {
       setInsights(prev => ({
@@ -604,6 +638,73 @@ export default function App() {
         ...prev,
         keyTerms: [result, ...prev.keyTerms.filter(t => t.term !== result.term)]
       }));
+    }
+  };
+
+  const handleExportPdf = async () => {
+    if (transcript.length === 0) return;
+
+    const pdfRoot = document.createElement('div');
+    pdfRoot.style.padding = '28px';
+    pdfRoot.style.background = '#ffffff';
+    pdfRoot.style.color = '#111827';
+    pdfRoot.style.fontFamily = 'sans-serif';
+    pdfRoot.style.width = '800px';
+
+    const rows = transcript
+      .map((seg, index) => {
+        const label = getSegmentSummaryLabel(seg.text);
+        const time = new Date(seg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        return `
+          <li style="margin-bottom: 14px;">
+            <div style="display:flex; gap:8px; align-items:center; margin-bottom:4px;">
+              <strong style="font-size:13px;">${index + 1}. ${escapeHtml(label)}</strong>
+              <span style="font-size:11px; color:#6B7280;">${time}</span>
+            </div>
+            <p style="margin:0; font-size:13px; line-height:1.6;">${escapeHtml(seg.text)}</p>
+          </li>
+        `;
+      })
+      .join('');
+
+    const termRows = insights.keyTerms
+      .map(item => `<li style="margin-bottom:8px;"><strong>${escapeHtml(item.term)}</strong>: ${escapeHtml(item.definition)}</li>`)
+      .join('');
+
+    pdfRoot.innerHTML = `
+      <h1 style="margin:0 0 8px; font-size:24px;">会話記録レポート</h1>
+      <p style="margin:0 0 16px; font-size:12px; color:#6B7280;">
+        出力日時: ${new Date().toLocaleString()}
+      </p>
+      <section style="margin-bottom:18px;">
+        <h2 style="font-size:16px; margin:0 0 8px;">全体要約</h2>
+        <p style="font-size:13px; line-height:1.7; margin:0;">${escapeHtml(insights.summary || '要約はまだ生成されていません。')}</p>
+      </section>
+      <section style="margin-bottom:18px;">
+        <h2 style="font-size:16px; margin:0 0 8px;">録音内容（全文）</h2>
+        <ol style="padding-left:18px; margin:0;">${rows}</ol>
+      </section>
+      <section>
+        <h2 style="font-size:16px; margin:0 0 8px;">キーワード</h2>
+        <ul style="padding-left:18px; margin:0;">${termRows || '<li>キーワードはまだありません。</li>'}</ul>
+      </section>
+    `;
+
+    document.body.appendChild(pdfRoot);
+
+    try {
+      await html2pdf()
+        .set({
+          margin: 0.5,
+          filename: `conversation-summary-${new Date().toISOString().slice(0, 10)}.pdf`,
+          image: { type: 'jpeg', quality: 0.98 },
+          html2canvas: { scale: 2, useCORS: true },
+          jsPDF: { unit: 'in', format: 'a4', orientation: 'portrait' }
+        })
+        .from(pdfRoot)
+        .save();
+    } finally {
+      document.body.removeChild(pdfRoot);
     }
   };
 
@@ -637,6 +738,7 @@ export default function App() {
                 summary={insights.summary}
                 isRecording={isRecording}
                 onToggleRecording={isRecording ? stopRecording : startRecording}
+                onExportPdf={handleExportPdf}
                 selectedNodeId={selectedNodeId}
                 conversationNodes={insights.nodes}
                 keyTerms={insights.keyTerms}
