@@ -7,11 +7,36 @@ export interface TranscriptSegment {
   timestamp: number;
 }
 
+const LONG_SILENCE_MS = 15000;
+const SHORT_PAUSE_MS = 1800;
+const SHORT_PAUSE_MIN_CHARS = 10;
+
+const appendChunk = (base: string, addition: string) => {
+  const next = addition.replace(/\s+/g, ' ').trim();
+  if (!next) return base;
+  if (!base) return next;
+  return `${base} ${next}`.replace(/\s+/g, ' ').trim();
+};
+
+const splitBySentenceBoundary = (text: string) => {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (!normalized) return { committed: [] as string[], remainder: '' };
+  const parts = normalized.split(/(?<=[。！？!?])\s*/).filter(Boolean);
+  const hasTerminalPunctuation = /[。！？!?]\s*$/.test(normalized);
+  const committed = hasTerminalPunctuation ? parts : parts.slice(0, -1);
+  const remainder = hasTerminalPunctuation ? '' : (parts[parts.length - 1] || '');
+  return { committed, remainder };
+};
+
 export function useTranscription() {
   const [isRecording, setIsRecording] = useState(false);
   const [transcript, setTranscript] = useState<TranscriptSegment[]>([]);
   const [interimText, setInterimText] = useState('');
   const recognitionRef = useRef<any>(null);
+  const isRecordingRef = useRef(false);
+  const draftFinalBufferRef = useRef('');
+  const shortPauseTimerRef = useRef<number | null>(null);
+  const longSilenceTimerRef = useRef<number | null>(null);
 
   // Simulation Data
   const simulationData = [
@@ -26,6 +51,67 @@ export function useTranscription() {
 
   const simulationIndexRef = useRef(0);
   const simulationTimeoutRef = useRef<any>(null);
+
+  const clearSilenceTimers = useCallback(() => {
+    if (shortPauseTimerRef.current) {
+      window.clearTimeout(shortPauseTimerRef.current);
+      shortPauseTimerRef.current = null;
+    }
+    if (longSilenceTimerRef.current) {
+      window.clearTimeout(longSilenceTimerRef.current);
+      longSilenceTimerRef.current = null;
+    }
+  }, []);
+
+  const pushCommittedSegment = useCallback((text: string) => {
+    const cleaned = text.replace(/\s+/g, ' ').trim();
+    if (!cleaned) return;
+    setTranscript(prev => [...prev, {
+      id: Math.random().toString(36).substr(2, 9),
+      text: cleaned,
+      speaker: 'You',
+      timestamp: Date.now()
+    }]);
+  }, []);
+
+  const flushCommittedByPunctuation = useCallback(() => {
+    const { committed, remainder } = splitBySentenceBoundary(draftFinalBufferRef.current);
+    if (committed.length === 0) return;
+    committed.forEach(pushCommittedSegment);
+    draftFinalBufferRef.current = remainder;
+    setInterimText(draftFinalBufferRef.current);
+  }, [pushCommittedSegment]);
+
+  const flushAllDraft = useCallback(() => {
+    const cleaned = draftFinalBufferRef.current.replace(/\s+/g, ' ').trim();
+    if (!cleaned) return;
+    pushCommittedSegment(cleaned);
+    draftFinalBufferRef.current = '';
+    setInterimText('');
+  }, [pushCommittedSegment]);
+
+  const restartActivityTimers = useCallback(() => {
+    if (!isRecordingRef.current) return;
+
+    if (shortPauseTimerRef.current) {
+      window.clearTimeout(shortPauseTimerRef.current);
+    }
+    shortPauseTimerRef.current = window.setTimeout(() => {
+      const currentDraft = draftFinalBufferRef.current.replace(/\s+/g, ' ').trim();
+      if (currentDraft.length >= SHORT_PAUSE_MIN_CHARS) {
+        pushCommittedSegment(currentDraft);
+        draftFinalBufferRef.current = '';
+        setInterimText('');
+      }
+    }, SHORT_PAUSE_MS);
+
+    if (longSilenceTimerRef.current) {
+      window.clearTimeout(longSilenceTimerRef.current);
+    }
+    longSilenceTimerRef.current = window.setTimeout(() => {
+      flushAllDraft();
+    }, LONG_SILENCE_MS);
+  }, [flushAllDraft, pushCommittedSegment]);
 
   const startSimulation = useCallback(() => {
     simulationIndexRef.current = 0;
@@ -48,6 +134,9 @@ export function useTranscription() {
   }, []);
 
   const startRecording = useCallback(() => {
+    draftFinalBufferRef.current = '';
+    setInterimText('');
+    isRecordingRef.current = true;
     setIsRecording(true);
     
     // Try Web Speech API
@@ -59,21 +148,21 @@ export function useTranscription() {
       recognition.lang = 'ja-JP';
 
       recognition.onresult = (event: any) => {
+        restartActivityTimers();
         let interim = '';
         for (let i = event.resultIndex; i < event.results.length; ++i) {
           if (event.results[i].isFinal) {
             const text = event.results[i][0].transcript;
-            setTranscript(prev => [...prev, {
-              id: Math.random().toString(36).substr(2, 9),
-              text,
-              speaker: 'You',
-              timestamp: Date.now()
-            }]);
+            draftFinalBufferRef.current = appendChunk(draftFinalBufferRef.current, text);
           } else {
-            interim += event.results[i][0].transcript;
+            interim = appendChunk(interim, event.results[i][0].transcript);
           }
         }
-        setInterimText(interim);
+
+        flushCommittedByPunctuation();
+
+        const liveDraft = appendChunk(draftFinalBufferRef.current, interim);
+        setInterimText(liveDraft);
       };
 
       recognition.onerror = (event: any) => {
@@ -86,12 +175,13 @@ export function useTranscription() {
 
       recognition.onend = () => {
         // Auto-restart if still recording
-        if (isRecording) recognition.start();
+        if (isRecordingRef.current) recognition.start();
       };
 
       recognitionRef.current = recognition;
       try {
         recognition.start();
+        restartActivityTimers();
       } catch (e) {
         startSimulation();
       }
@@ -99,17 +189,27 @@ export function useTranscription() {
       // Fallback to simulation
       startSimulation();
     }
-  }, [isRecording, startSimulation]);
+  }, [flushCommittedByPunctuation, restartActivityTimers, startSimulation]);
 
   const stopRecording = useCallback(() => {
+    isRecordingRef.current = false;
     setIsRecording(false);
+    clearSilenceTimers();
+    flushAllDraft();
     if (recognitionRef.current) {
       recognitionRef.current.stop();
     }
     if (simulationTimeoutRef.current) {
       clearTimeout(simulationTimeoutRef.current);
     }
-  }, []);
+  }, [clearSilenceTimers, flushAllDraft]);
+
+  useEffect(() => {
+    return () => {
+      isRecordingRef.current = false;
+      clearSilenceTimers();
+    };
+  }, [clearSilenceTimers]);
 
   return {
     isRecording,

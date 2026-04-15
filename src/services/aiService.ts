@@ -6,6 +6,43 @@ const apiKey =
   "";
 
 const ai = new GoogleGenAI({ apiKey });
+const ANALYZE_TIMEOUT_MS = 15000;
+const ANALYZE_MAX_RETRIES = 3;
+const RETRYABLE_ERROR_CODES = [429, 500, 502, 503, 504];
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const withTimeout = async <T>(promise: Promise<T>, timeoutMs: number): Promise<T> => {
+  let timer: number | null = null;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = window.setTimeout(() => {
+      reject(new Error(`AI request timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timer) window.clearTimeout(timer);
+  }
+};
+
+const getStatusCodeFromError = (error: unknown): number | null => {
+  if (!error || typeof error !== 'object') return null;
+  const maybeStatus = (error as any).status ?? (error as any).statusCode;
+  return typeof maybeStatus === 'number' ? maybeStatus : null;
+};
+
+const isRetryableError = (error: unknown): boolean => {
+  const statusCode = getStatusCodeFromError(error);
+  if (statusCode !== null) {
+    return RETRYABLE_ERROR_CODES.includes(statusCode);
+  }
+  if (error instanceof Error) {
+    return /timed out|network|fetch/i.test(error.message);
+  }
+  return false;
+};
 
 export interface ConversationNode {
   id: string;
@@ -26,10 +63,7 @@ export interface InsightData {
 export async function analyzeConversation(transcript: string, currentNodes: ConversationNode[]): Promise<InsightData | null> {
   if (!transcript || transcript.length < 20) return null;
 
-  try {
-    const response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview",
-      contents: `
+  const prompt = `
         あなたは会話の論理構造をリアルタイムで図解するエキスパートです。
         以下の会話テキストと現在のマップ構造を元に、最新の論理構造マップ（フルセット）を作成してください。
 
@@ -63,52 +97,69 @@ export async function analyzeConversation(transcript: string, currentNodes: Conv
           ],
           "keyTerms": [{ "term": "用語", "definition": "簡潔な説明", "detail": "詳細な背景" }]
         }
-      `,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            summary: { type: Type.STRING },
-            nodes: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  id: { type: Type.STRING },
-                  type: { type: Type.STRING, enum: ['topic', 'reason', 'example', 'supplement', 'summary'] },
-                  text: { type: Type.STRING },
-                  shortLabel: { type: Type.STRING },
-                  parentId: { type: Type.STRING },
-                  sourceSegmentIds: { type: Type.ARRAY, items: { type: Type.STRING } },
-                  sourceTextSnippet: { type: Type.STRING }
-                },
-                required: ['id', 'type', 'text', 'shortLabel']
-              }
-            },
-            keyTerms: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  term: { type: Type.STRING },
-                  definition: { type: Type.STRING },
-                  detail: { type: Type.STRING }
-                },
-                required: ['term', 'definition']
-              }
-            }
-          },
-          required: ['summary', 'nodes', 'keyTerms']
-        }
-      }
-    });
+      `;
 
-    return JSON.parse(response.text);
-  } catch (error) {
-    console.error("AI Analysis Error:", error);
-    return null;
+  for (let attempt = 0; attempt < ANALYZE_MAX_RETRIES; attempt++) {
+    try {
+      const response = await withTimeout(
+        ai.models.generateContent({
+          model: "gemini-3-flash-preview",
+          contents: prompt,
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                summary: { type: Type.STRING },
+                nodes: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      id: { type: Type.STRING },
+                      type: { type: Type.STRING, enum: ['topic', 'reason', 'example', 'supplement', 'summary'] },
+                      text: { type: Type.STRING },
+                      shortLabel: { type: Type.STRING },
+                      parentId: { type: Type.STRING },
+                      sourceSegmentIds: { type: Type.ARRAY, items: { type: Type.STRING } },
+                      sourceTextSnippet: { type: Type.STRING }
+                    },
+                    required: ['id', 'type', 'text', 'shortLabel']
+                  }
+                },
+                keyTerms: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      term: { type: Type.STRING },
+                      definition: { type: Type.STRING },
+                      detail: { type: Type.STRING }
+                    },
+                    required: ['term', 'definition']
+                  }
+                }
+              },
+              required: ['summary', 'nodes', 'keyTerms']
+            }
+          }
+        }),
+        ANALYZE_TIMEOUT_MS
+      );
+
+      return JSON.parse(response.text);
+    } catch (error) {
+      const isLastAttempt = attempt === ANALYZE_MAX_RETRIES - 1;
+      if (!isRetryableError(error) || isLastAttempt) {
+        console.error("AI Analysis Error:", error);
+        return null;
+      }
+      const baseDelay = 800 * Math.pow(2, attempt);
+      const jitter = Math.floor(Math.random() * 400);
+      await sleep(baseDelay + jitter);
+    }
   }
+  return null;
 }
 
 export async function getTermDefinition(term: string): Promise<{ term: string; definition: string; detail?: string } | null> {

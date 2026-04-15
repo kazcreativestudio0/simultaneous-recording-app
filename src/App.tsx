@@ -442,7 +442,6 @@ const MainStream = ({
               <div className="flex-1">
                 <div className="flex items-center gap-2 mb-1">
                   <span className="font-bold text-sm text-gray-900">{summaryLabel}</span>
-                  <span className="text-[10px] text-blue-500 bg-blue-50 px-2 py-0.5 rounded-full border border-blue-100">要約ラベル</span>
                   <span className="text-[10px] text-gray-400">{new Date(seg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                 </div>
                 {renderHighlightedText(seg)}
@@ -612,6 +611,7 @@ const InsightPanel = ({ keyTerms, onAddTerm }: { keyTerms: { term: string, defin
 // --- Main App ---
 
 export default function App() {
+  const ANALYZE_MIN_INTERVAL_MS = 8000;
   const { isRecording, transcript, interimText, startRecording, stopRecording } = useTranscription();
   const [insights, setInsights] = useState<InsightData>({
     summary: '',
@@ -621,23 +621,45 @@ export default function App() {
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const lastAnalyzedIndex = useRef(0);
+  const lastAnalyzeAtRef = useRef(0);
+  const queuedRefreshRef = useRef(false);
 
-  const handleManualRefresh = async () => {
-    if (transcript.length === 0 || isAnalyzing) return;
+  const handleManualRefresh = async (force = false) => {
+    if (transcript.length === 0) return;
+    if (isAnalyzing) {
+      queuedRefreshRef.current = true;
+      return;
+    }
+    const now = Date.now();
+    if (!force && now - lastAnalyzeAtRef.current < ANALYZE_MIN_INTERVAL_MS) {
+      queuedRefreshRef.current = true;
+      return;
+    }
+
+    lastAnalyzeAtRef.current = now;
     setIsAnalyzing(true);
     const fullText = transcript
       .map(t => `[ID:${t.id}] ${getSegmentSummaryLabel(t.text)}: ${t.text}`)
       .join('\n');
-    const result = await analyzeConversation(fullText, insights.nodes);
-    if (result) {
-      setInsights(prev => ({
-        summary: result.summary,
-        nodes: result.nodes,
-        keyTerms: [...prev.keyTerms, ...result.keyTerms.filter(t => !prev.keyTerms.find(pt => pt.term === t.term))]
-      }));
-      lastAnalyzedIndex.current = transcript.length;
+    try {
+      const result = await analyzeConversation(fullText, insights.nodes);
+      if (result) {
+        setInsights(prev => ({
+          summary: result.summary,
+          nodes: result.nodes,
+          keyTerms: [...prev.keyTerms, ...result.keyTerms.filter(t => !prev.keyTerms.find(pt => pt.term === t.term))]
+        }));
+        lastAnalyzedIndex.current = transcript.length;
+      }
+    } finally {
+      setIsAnalyzing(false);
+      if (queuedRefreshRef.current) {
+        queuedRefreshRef.current = false;
+        window.setTimeout(() => {
+          handleManualRefresh(true);
+        }, 250);
+      }
     }
-    setIsAnalyzing(false);
   };
 
   // Analyze conversation every 3 segments
