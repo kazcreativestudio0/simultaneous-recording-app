@@ -19,10 +19,18 @@ import {
   User,
   Clock,
   LayoutDashboard,
-  FileDown
+  FileDown,
+  Radio,
+  Wifi
 } from 'lucide-react';
 import { useTranscription, TranscriptSegment } from './hooks/useTranscription';
 import { analyzeConversation, getTermDefinition, ConversationNode, InsightData } from './services/aiService';
+import { LatestOnlyQueue } from './services/networkQueue';
+import {
+  NetworkMode,
+  TranscriptionMode,
+  TranscriptionSettings,
+} from './services/transcriptionProviders/types';
 import html2pdf from 'html2pdf.js';
 
 import { 
@@ -33,7 +41,19 @@ import {
 
 // --- Components ---
 
-const Header = () => (
+const Header = ({
+  settings,
+  onSettingsChange,
+  transcriptionStatusLabel,
+  analysisStatusLabel,
+  isRecording,
+}: {
+  settings: TranscriptionSettings;
+  onSettingsChange: (next: Partial<TranscriptionSettings>) => void;
+  transcriptionStatusLabel: string;
+  analysisStatusLabel: string;
+  isRecording: boolean;
+}) => (
   <header className="h-14 border-b border-gray-200 bg-white flex items-center justify-between px-6 sticky top-0 z-50">
     <div className="flex items-center gap-2">
       <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center text-white">
@@ -42,10 +62,34 @@ const Header = () => (
       <h1 className="font-bold text-xl tracking-tight text-gray-900">EchoMap</h1>
       <span className="text-xs font-medium px-2 py-0.5 bg-blue-50 text-blue-600 rounded-full border border-blue-100 ml-2">BETA</span>
     </div>
-    <div className="flex items-center gap-4">
+    <div className="flex items-center gap-3">
+      <label className="flex items-center gap-1.5 text-xs text-gray-500">
+        <Radio size={13} />
+        <select
+          value={settings.transcriptionMode}
+          disabled={isRecording}
+          onChange={(e) => onSettingsChange({ transcriptionMode: e.target.value as TranscriptionMode })}
+          className="rounded-md border border-gray-200 bg-white px-2 py-1 text-xs text-gray-700 outline-none focus:border-blue-400 disabled:opacity-50"
+        >
+          <option value="standard">標準認識</option>
+          <option value="high-accuracy">高精度認識</option>
+        </select>
+      </label>
+      <label className="flex items-center gap-1.5 text-xs text-gray-500">
+        <Wifi size={13} />
+        <select
+          value={settings.networkMode}
+          disabled={isRecording}
+          onChange={(e) => onSettingsChange({ networkMode: e.target.value as NetworkMode })}
+          className="rounded-md border border-gray-200 bg-white px-2 py-1 text-xs text-gray-700 outline-none focus:border-blue-400 disabled:opacity-50"
+        >
+          <option value="balanced">通信バランス</option>
+          <option value="low-bandwidth">省通信</option>
+        </select>
+      </label>
       <div className="flex items-center gap-2 text-sm text-gray-500">
         <Activity size={14} className="text-green-500 animate-pulse" />
-        <span>System Ready</span>
+        <span>{transcriptionStatusLabel} / {analysisStatusLabel}</span>
       </div>
       <div className="w-8 h-8 rounded-full bg-gray-100 border border-gray-200 flex items-center justify-center text-gray-600">
         <User size={18} />
@@ -611,8 +655,19 @@ const InsightPanel = ({ keyTerms, onAddTerm }: { keyTerms: { term: string, defin
 // --- Main App ---
 
 export default function App() {
-  const ANALYZE_MIN_INTERVAL_MS = 8000;
-  const { isRecording, transcript, interimText, startRecording, stopRecording } = useTranscription();
+  const SETTINGS_STORAGE_KEY = 'echo-map-settings';
+  const [settings, setSettings] = useState<TranscriptionSettings>({
+    transcriptionMode: 'standard',
+    networkMode: 'balanced',
+  });
+  const {
+    isRecording,
+    transcript,
+    interimText,
+    transcriptionStatusLabel,
+    startRecording,
+    stopRecording,
+  } = useTranscription(settings);
   const [insights, setInsights] = useState<InsightData>({
     summary: '',
     nodes: [],
@@ -620,57 +675,137 @@ export default function App() {
   });
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [analysisStatusLabel, setAnalysisStatusLabel] = useState('解析待機');
   const lastAnalyzedIndex = useRef(0);
   const lastAnalyzeAtRef = useRef(0);
-  const queuedRefreshRef = useRef(false);
+  const analyzeDelayTimerRef = useRef<number | null>(null);
+  const latestTranscriptRef = useRef(transcript);
+  const latestNodesRef = useRef(insights.nodes);
+  const analysisQueueRef = useRef<LatestOnlyQueue<{ fullText: string; transcriptLength: number; currentNodes: ConversationNode[] }> | null>(null);
 
-  const handleManualRefresh = async (force = false) => {
-    if (transcript.length === 0) return;
-    if (isAnalyzing) {
-      queuedRefreshRef.current = true;
-      return;
-    }
-    const now = Date.now();
-    if (!force && now - lastAnalyzeAtRef.current < ANALYZE_MIN_INTERVAL_MS) {
-      queuedRefreshRef.current = true;
-      return;
-    }
-
-    lastAnalyzeAtRef.current = now;
-    setIsAnalyzing(true);
-    const fullText = transcript
-      .map(t => `[ID:${t.id}] ${getSegmentSummaryLabel(t.text)}: ${t.text}`)
-      .join('\n');
+  useEffect(() => {
+    const saved = window.localStorage.getItem(SETTINGS_STORAGE_KEY);
+    if (!saved) return;
     try {
-      const result = await analyzeConversation(fullText, insights.nodes);
-      if (result) {
-        setInsights(prev => ({
-          summary: result.summary,
-          nodes: result.nodes,
-          keyTerms: [...prev.keyTerms, ...result.keyTerms.filter(t => !prev.keyTerms.find(pt => pt.term === t.term))]
-        }));
-        lastAnalyzedIndex.current = transcript.length;
-      }
-    } finally {
-      setIsAnalyzing(false);
-      if (queuedRefreshRef.current) {
-        queuedRefreshRef.current = false;
-        window.setTimeout(() => {
-          handleManualRefresh(true);
-        }, 250);
-      }
+      const parsed = JSON.parse(saved) as Partial<TranscriptionSettings>;
+      setSettings(prev => ({
+        transcriptionMode: parsed.transcriptionMode === 'high-accuracy' ? 'high-accuracy' : prev.transcriptionMode,
+        networkMode: parsed.networkMode === 'low-bandwidth' ? 'low-bandwidth' : prev.networkMode,
+      }));
+    } catch {
+      // Ignore malformed saved settings.
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+  }, [settings]);
+
+  useEffect(() => {
+    latestTranscriptRef.current = transcript;
+  }, [transcript]);
+
+  useEffect(() => {
+    latestNodesRef.current = insights.nodes;
+  }, [insights.nodes]);
+
+  const getAnalyzeMinInterval = useCallback(
+    () => (settings.networkMode === 'low-bandwidth' ? 14000 : 8000),
+    [settings.networkMode]
+  );
+
+  const getAnalyzeSegmentInterval = useCallback(
+    () => (settings.networkMode === 'low-bandwidth' ? 5 : 3),
+    [settings.networkMode]
+  );
+
+  if (!analysisQueueRef.current) {
+    analysisQueueRef.current = new LatestOnlyQueue(async ({ fullText, transcriptLength, currentNodes }) => {
+      if (!fullText) return;
+      setIsAnalyzing(true);
+      setAnalysisStatusLabel('解析中');
+      lastAnalyzeAtRef.current = Date.now();
+      try {
+        const result = await analyzeConversation(fullText, currentNodes);
+        if (result) {
+          setInsights(prev => ({
+            summary: result.summary,
+            nodes: result.nodes,
+            keyTerms: [...prev.keyTerms, ...result.keyTerms.filter(t => !prev.keyTerms.find(pt => pt.term === t.term))]
+          }));
+          lastAnalyzedIndex.current = transcriptLength;
+          setAnalysisStatusLabel('最新反映済み');
+        } else {
+          setAnalysisStatusLabel('解析待機');
+        }
+      } catch {
+        setAnalysisStatusLabel('解析再試行中');
+      } finally {
+        setIsAnalyzing(false);
+      }
+    });
+  }
+
+  const enqueueLatestAnalysis = useCallback((force = false) => {
+    if (analyzeDelayTimerRef.current) {
+      window.clearTimeout(analyzeDelayTimerRef.current);
+      analyzeDelayTimerRef.current = null;
+    }
+
+    const currentTranscript = latestTranscriptRef.current;
+    if (currentTranscript.length === 0) return;
+
+    const now = Date.now();
+    const minInterval = getAnalyzeMinInterval();
+    const waitMs = Math.max(0, minInterval - (now - lastAnalyzeAtRef.current));
+
+    const run = () => {
+      const nextTranscript = latestTranscriptRef.current;
+      const fullText = nextTranscript
+        .map(t => `[ID:${t.id}] ${getSegmentSummaryLabel(t.text)}: ${t.text}`)
+        .join('\n');
+      analysisQueueRef.current?.enqueue({
+        fullText,
+        transcriptLength: nextTranscript.length,
+        currentNodes: latestNodesRef.current,
+      });
+      setAnalysisStatusLabel('解析待ち');
+    };
+
+    if (force || waitMs === 0) {
+      run();
+      return;
+    }
+
+    analyzeDelayTimerRef.current = window.setTimeout(run, waitMs);
+  }, [getAnalyzeMinInterval]);
+
+  const handleManualRefresh = useCallback((force = false) => {
+    enqueueLatestAnalysis(force);
+  }, [enqueueLatestAnalysis]);
 
   // Analyze conversation every 3 segments
   useEffect(() => {
-    const analyze = async () => {
-      if (transcript.length > 0 && transcript.length % 3 === 0 && transcript.length !== lastAnalyzedIndex.current) {
-        handleManualRefresh();
+    if (transcript.length === 0 || transcript.length === lastAnalyzedIndex.current) return;
+    const segmentInterval = getAnalyzeSegmentInterval();
+    const reachedSegmentBoundary = transcript.length % segmentInterval === 0;
+    const shouldCatchUpByTime = Date.now() - lastAnalyzeAtRef.current > getAnalyzeMinInterval();
+    if (reachedSegmentBoundary || shouldCatchUpByTime) {
+      handleManualRefresh();
+    }
+  }, [getAnalyzeMinInterval, getAnalyzeSegmentInterval, handleManualRefresh, transcript]);
+
+  useEffect(() => {
+    return () => {
+      if (analyzeDelayTimerRef.current) {
+        window.clearTimeout(analyzeDelayTimerRef.current);
       }
     };
-    analyze();
-  }, [transcript]);
+  }, []);
+
+  const updateSettings = (next: Partial<TranscriptionSettings>) => {
+    setSettings(prev => ({ ...prev, ...next }));
+  };
 
   const handleManualAddTerm = async (term: string) => {
     const result = await getTermDefinition(term);
@@ -751,7 +886,13 @@ export default function App() {
 
   return (
     <div className="flex flex-col h-screen bg-[#F8F9FA] font-sans text-gray-900 selection:bg-blue-100">
-      <Header />
+      <Header
+        settings={settings}
+        onSettingsChange={updateSettings}
+        transcriptionStatusLabel={transcriptionStatusLabel}
+        analysisStatusLabel={analysisStatusLabel}
+        isRecording={isRecording}
+      />
       
       <main className="flex-1 overflow-hidden">
         <Group direction="horizontal">

@@ -44,6 +44,39 @@ const isRetryableError = (error: unknown): boolean => {
   return false;
 };
 
+const generateJsonWithRetries = async <T>(contents: string, responseSchema: any): Promise<T | null> => {
+  const modelName = "gemini-3-flash-preview";
+
+  for (let attempt = 0; attempt < ANALYZE_MAX_RETRIES; attempt++) {
+    try {
+      const response = await withTimeout(
+        ai.models.generateContent({
+          model: modelName,
+          contents,
+          config: {
+            responseMimeType: "application/json",
+            responseSchema
+          }
+        }),
+        ANALYZE_TIMEOUT_MS
+      );
+
+      return JSON.parse(response.text) as T;
+    } catch (error) {
+      const isLastAttempt = attempt === ANALYZE_MAX_RETRIES - 1;
+      if (!isRetryableError(error) || isLastAttempt) {
+        console.error(`AI request failed for ${modelName}:`, error);
+        return null;
+      }
+      const baseDelay = 800 * Math.pow(2, attempt);
+      const jitter = Math.floor(Math.random() * 400);
+      await sleep(baseDelay + jitter);
+    }
+  }
+
+  return null;
+};
+
 export interface ConversationNode {
   id: string;
   type: 'topic' | 'reason' | 'example' | 'supplement' | 'summary';
@@ -60,7 +93,10 @@ export interface InsightData {
   keyTerms: { term: string; definition: string; detail?: string }[];
 }
 
-export async function analyzeConversation(transcript: string, currentNodes: ConversationNode[]): Promise<InsightData | null> {
+export async function analyzeConversation(
+  transcript: string,
+  currentNodes: ConversationNode[]
+): Promise<InsightData | null> {
   if (!transcript || transcript.length < 20) return null;
 
   const prompt = `
@@ -99,84 +135,29 @@ export async function analyzeConversation(transcript: string, currentNodes: Conv
         }
       `;
 
-  for (let attempt = 0; attempt < ANALYZE_MAX_RETRIES; attempt++) {
-    try {
-      const response = await withTimeout(
-        ai.models.generateContent({
-          model: "gemini-3-flash-preview",
-          contents: prompt,
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                summary: { type: Type.STRING },
-                nodes: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      id: { type: Type.STRING },
-                      type: { type: Type.STRING, enum: ['topic', 'reason', 'example', 'supplement', 'summary'] },
-                      text: { type: Type.STRING },
-                      shortLabel: { type: Type.STRING },
-                      parentId: { type: Type.STRING },
-                      sourceSegmentIds: { type: Type.ARRAY, items: { type: Type.STRING } },
-                      sourceTextSnippet: { type: Type.STRING }
-                    },
-                    required: ['id', 'type', 'text', 'shortLabel']
-                  }
-                },
-                keyTerms: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      term: { type: Type.STRING },
-                      definition: { type: Type.STRING },
-                      detail: { type: Type.STRING }
-                    },
-                    required: ['term', 'definition']
-                  }
-                }
-              },
-              required: ['summary', 'nodes', 'keyTerms']
-            }
-          }
-        }),
-        ANALYZE_TIMEOUT_MS
-      );
-
-      return JSON.parse(response.text);
-    } catch (error) {
-      const isLastAttempt = attempt === ANALYZE_MAX_RETRIES - 1;
-      if (!isRetryableError(error) || isLastAttempt) {
-        console.error("AI Analysis Error:", error);
-        return null;
-      }
-      const baseDelay = 800 * Math.pow(2, attempt);
-      const jitter = Math.floor(Math.random() * 400);
-      await sleep(baseDelay + jitter);
-    }
-  }
-  return null;
-}
-
-export async function getTermDefinition(term: string): Promise<{ term: string; definition: string; detail?: string } | null> {
-  try {
-    const response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview",
-      contents: `用語「${term}」について、IT/ビジネスの文脈で解説してください。
-      
-      出力形式 (JSON):
-      {
-        "term": "${term}",
-        "definition": "一言でわかる簡潔な説明",
-        "detail": "より詳細な背景や関連情報"
-      }`,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
+  return generateJsonWithRetries<InsightData>(prompt, {
+    type: Type.OBJECT,
+    properties: {
+      summary: { type: Type.STRING },
+      nodes: {
+        type: Type.ARRAY,
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            id: { type: Type.STRING },
+            type: { type: Type.STRING, enum: ['topic', 'reason', 'example', 'supplement', 'summary'] },
+            text: { type: Type.STRING },
+            shortLabel: { type: Type.STRING },
+            parentId: { type: Type.STRING },
+            sourceSegmentIds: { type: Type.ARRAY, items: { type: Type.STRING } },
+            sourceTextSnippet: { type: Type.STRING }
+          },
+          required: ['id', 'type', 'text', 'shortLabel']
+        }
+      },
+      keyTerms: {
+        type: Type.ARRAY,
+        items: {
           type: Type.OBJECT,
           properties: {
             term: { type: Type.STRING },
@@ -186,10 +167,28 @@ export async function getTermDefinition(term: string): Promise<{ term: string; d
           required: ['term', 'definition']
         }
       }
-    });
-    return JSON.parse(response.text);
-  } catch (error) {
-    console.error("Term Definition Error:", error);
-    return null;
-  }
+    },
+    required: ['summary', 'nodes', 'keyTerms']
+  });
+}
+
+export async function getTermDefinition(
+  term: string
+): Promise<{ term: string; definition: string; detail?: string } | null> {
+  return generateJsonWithRetries(`用語「${term}」について、IT/ビジネスの文脈で解説してください。
+      
+      出力形式 (JSON):
+      {
+        "term": "${term}",
+        "definition": "一言でわかる簡潔な説明",
+        "detail": "より詳細な背景や関連情報"
+      }`, {
+    type: Type.OBJECT,
+    properties: {
+      term: { type: Type.STRING },
+      definition: { type: Type.STRING },
+      detail: { type: Type.STRING }
+    },
+    required: ['term', 'definition']
+  });
 }

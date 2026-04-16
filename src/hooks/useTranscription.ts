@@ -1,4 +1,11 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { BrowserSpeechProvider } from '../services/transcriptionProviders/browserSpeechProvider';
+import { ApiTranscriptionProvider } from '../services/transcriptionProviders/apiTranscriptionProvider';
+import {
+  TranscriptionProvider,
+  TranscriptionSettings,
+  TranscriptionStatus,
+} from '../services/transcriptionProviders/types';
 
 export interface TranscriptSegment {
   id: string;
@@ -10,6 +17,7 @@ export interface TranscriptSegment {
 const LONG_SILENCE_MS = 15000;
 const SHORT_PAUSE_MS = 1800;
 const SHORT_PAUSE_MIN_CHARS = 10;
+const INTERIM_GRACE_MS = 2200;
 
 const appendChunk = (base: string, addition: string) => {
   const next = addition.replace(/\s+/g, ' ').trim();
@@ -28,15 +36,26 @@ const splitBySentenceBoundary = (text: string) => {
   return { committed, remainder };
 };
 
-export function useTranscription() {
+const statusLabels: Record<TranscriptionStatus, string> = {
+  idle: '待機中',
+  listening: '認識中',
+  reconnecting: '再接続中',
+  processing: '音声解析中',
+  'waiting-network': '回線待ち',
+  fallback: '簡易モード',
+};
+
+export function useTranscription(settings: TranscriptionSettings) {
   const [isRecording, setIsRecording] = useState(false);
   const [transcript, setTranscript] = useState<TranscriptSegment[]>([]);
   const [interimText, setInterimText] = useState('');
-  const recognitionRef = useRef<any>(null);
+  const [transcriptionStatus, setTranscriptionStatus] = useState<TranscriptionStatus>('idle');
   const isRecordingRef = useRef(false);
   const draftFinalBufferRef = useRef('');
   const shortPauseTimerRef = useRef<number | null>(null);
   const longSilenceTimerRef = useRef<number | null>(null);
+  const interimGraceTimerRef = useRef<number | null>(null);
+  const providerRef = useRef<TranscriptionProvider | null>(null);
 
   // Simulation Data
   const simulationData = [
@@ -61,6 +80,10 @@ export function useTranscription() {
       window.clearTimeout(longSilenceTimerRef.current);
       longSilenceTimerRef.current = null;
     }
+    if (interimGraceTimerRef.current) {
+      window.clearTimeout(interimGraceTimerRef.current);
+      interimGraceTimerRef.current = null;
+    }
   }, []);
 
   const pushCommittedSegment = useCallback((text: string) => {
@@ -81,6 +104,11 @@ export function useTranscription() {
     draftFinalBufferRef.current = remainder;
     setInterimText(draftFinalBufferRef.current);
   }, [pushCommittedSegment]);
+
+  const syncLiveDraft = useCallback((interim = '') => {
+    const liveDraft = appendChunk(draftFinalBufferRef.current, interim);
+    setInterimText(liveDraft);
+  }, []);
 
   const flushAllDraft = useCallback(() => {
     const cleaned = draftFinalBufferRef.current.replace(/\s+/g, ' ').trim();
@@ -105,13 +133,20 @@ export function useTranscription() {
       }
     }, SHORT_PAUSE_MS);
 
+    if (interimGraceTimerRef.current) {
+      window.clearTimeout(interimGraceTimerRef.current);
+    }
+    interimGraceTimerRef.current = window.setTimeout(() => {
+      syncLiveDraft();
+    }, INTERIM_GRACE_MS);
+
     if (longSilenceTimerRef.current) {
       window.clearTimeout(longSilenceTimerRef.current);
     }
     longSilenceTimerRef.current = window.setTimeout(() => {
       flushAllDraft();
     }, LONG_SILENCE_MS);
-  }, [flushAllDraft, pushCommittedSegment]);
+  }, [flushAllDraft, pushCommittedSegment, syncLiveDraft]);
 
   const startSimulation = useCallback(() => {
     simulationIndexRef.current = 0;
@@ -133,81 +168,98 @@ export function useTranscription() {
     next();
   }, []);
 
+  const createProvider = useCallback((): TranscriptionProvider => {
+    const handlers = {
+      onInterim: (text: string) => {
+        syncLiveDraft(text);
+      },
+      onFinal: (text: string) => {
+        const cleaned = text.replace(/\s+/g, ' ').trim();
+        if (!cleaned) return;
+        draftFinalBufferRef.current = appendChunk(draftFinalBufferRef.current, cleaned);
+        flushCommittedByPunctuation();
+        syncLiveDraft();
+      },
+      onStatusChange: (status: TranscriptionStatus) => {
+        setTranscriptionStatus(status);
+      },
+      onActivity: () => {
+        restartActivityTimers();
+      },
+      onError: (error: unknown) => {
+        console.error('Transcription provider error', error);
+      },
+    };
+
+    if (settings.transcriptionMode === 'high-accuracy') {
+      return new ApiTranscriptionProvider(handlers, settings.networkMode);
+    }
+    return new BrowserSpeechProvider(handlers);
+  }, [
+    flushCommittedByPunctuation,
+    restartActivityTimers,
+    settings.networkMode,
+    settings.transcriptionMode,
+    syncLiveDraft,
+  ]);
+
   const startRecording = useCallback(() => {
     draftFinalBufferRef.current = '';
     setInterimText('');
     isRecordingRef.current = true;
     setIsRecording(true);
-    
-    // Try Web Speech API
-    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (SpeechRecognition) {
-      const recognition = new SpeechRecognition();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = 'ja-JP';
+    const provider = createProvider();
+    providerRef.current = provider;
 
-      recognition.onresult = (event: any) => {
+    provider.start()
+      .then(() => {
         restartActivityTimers();
-        let interim = '';
-        for (let i = event.resultIndex; i < event.results.length; ++i) {
-          if (event.results[i].isFinal) {
-            const text = event.results[i][0].transcript;
-            draftFinalBufferRef.current = appendChunk(draftFinalBufferRef.current, text);
-          } else {
-            interim = appendChunk(interim, event.results[i][0].transcript);
-          }
-        }
-
-        flushCommittedByPunctuation();
-
-        const liveDraft = appendChunk(draftFinalBufferRef.current, interim);
-        setInterimText(liveDraft);
-      };
-
-      recognition.onerror = (event: any) => {
-        console.error('Speech recognition error', event.error);
-        if (event.error === 'not-allowed') {
-          // Fallback to simulation if permission denied (common in iframes)
+      })
+      .catch((error) => {
+        console.error('Unable to start transcription provider', error);
+        const fallbackProvider = new BrowserSpeechProvider({
+          onInterim: (text) => syncLiveDraft(text),
+          onFinal: (text) => {
+            const cleaned = text.replace(/\s+/g, ' ').trim();
+            if (!cleaned) return;
+            draftFinalBufferRef.current = appendChunk(draftFinalBufferRef.current, cleaned);
+            flushCommittedByPunctuation();
+            syncLiveDraft();
+          },
+          onStatusChange: (status) => setTranscriptionStatus(status === 'idle' ? 'fallback' : status),
+          onActivity: () => restartActivityTimers(),
+          onError: (fallbackError) => {
+            console.error('Fallback browser provider error', fallbackError);
+            setTranscriptionStatus('fallback');
+            startSimulation();
+          },
+        });
+        providerRef.current = fallbackProvider;
+        fallbackProvider.start().catch(() => {
+          setTranscriptionStatus('fallback');
           startSimulation();
-        }
-      };
-
-      recognition.onend = () => {
-        // Auto-restart if still recording
-        if (isRecordingRef.current) recognition.start();
-      };
-
-      recognitionRef.current = recognition;
-      try {
-        recognition.start();
-        restartActivityTimers();
-      } catch (e) {
-        startSimulation();
-      }
-    } else {
-      // Fallback to simulation
-      startSimulation();
-    }
-  }, [flushCommittedByPunctuation, restartActivityTimers, startSimulation]);
+        });
+      });
+  }, [createProvider, flushCommittedByPunctuation, restartActivityTimers, startSimulation, syncLiveDraft]);
 
   const stopRecording = useCallback(() => {
     isRecordingRef.current = false;
     setIsRecording(false);
     clearSilenceTimers();
     flushAllDraft();
-    if (recognitionRef.current) {
-      recognitionRef.current.stop();
-    }
+    void providerRef.current?.stop();
+    providerRef.current = null;
     if (simulationTimeoutRef.current) {
       clearTimeout(simulationTimeoutRef.current);
     }
+    setTranscriptionStatus('idle');
   }, [clearSilenceTimers, flushAllDraft]);
 
   useEffect(() => {
     return () => {
       isRecordingRef.current = false;
       clearSilenceTimers();
+      void providerRef.current?.stop();
     };
   }, [clearSilenceTimers]);
 
@@ -215,6 +267,8 @@ export function useTranscription() {
     isRecording,
     transcript,
     interimText,
+    transcriptionStatus,
+    transcriptionStatusLabel: statusLabels[transcriptionStatus],
     startRecording,
     stopRecording
   };
